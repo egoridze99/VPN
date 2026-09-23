@@ -17,6 +17,22 @@ die() { echo "Ошибка: $*" >&2; exit 1; }
 
 name_ok() { [[ "${1:-}" =~ ^[a-z0-9_-]{2,32}$ ]]; }
 
+# Xray на RU-сервере — это ещё и SOCKS-порт 127.0.0.1:1080, через который сам
+# бот (TELEGRAM_PROXY) ходит в Telegram. Пока контейнер перезапускается, порт
+# на секунду-две пропадает, и если бот в этот момент попробует отправить
+# сообщение — оно не уйдёт. Ждём (до 15 секунд), пока порт снова откликнется,
+# прежде чем отдать управление обратно боту. Не считается ошибкой: устройство
+# уже добавлено/удалено к этому моменту, ждём только сеть.
+wait_socks() {
+  local i
+  for i in $(seq 1 30); do
+    (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null && { exec 3>&- 3<&- 2>/dev/null; return 0; }
+    sleep 0.5
+  done
+  echo "Предупреждение: SOCKS-порт 127.0.0.1:1080 не ответил за 15 секунд после перезапуска xray" >&2
+  return 0
+}
+
 mkdir -p "$BOT_OUT"
 
 cmd="${1:-}"
@@ -28,6 +44,7 @@ case "$cmd" in
     "$VPNCTL" add-device "$name"
     "$VPNCTL" sync-clients
     ( cd "$COMPOSE_DIR" && docker compose restart xray )
+    wait_socks
     ;;
 
   remove)
@@ -35,6 +52,7 @@ case "$cmd" in
     "$VPNCTL" remove-device "$name"
     "$VPNCTL" sync-clients
     ( cd "$COMPOSE_DIR" && docker compose restart xray )
+    wait_socks
     rm -f "$BOT_OUT/$name.txt" "$BOT_OUT/$name"-*.png
     ;;
 

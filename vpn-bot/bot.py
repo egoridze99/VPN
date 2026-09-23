@@ -25,7 +25,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.error import Forbidden
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -185,12 +185,18 @@ async def fetch_and_send(
         await run_helper("links", name)
     except RuntimeError as e:
         log.exception("links helper failed for %s", name)
-        await context.bot.send_message(user_id, f"Не получилось получить ссылки: {e}")
+        try:
+            await context.bot.send_message(user_id, f"Не получилось получить ссылки: {e}")
+        except TelegramError:
+            log.warning("could not notify %s about links helper failure", user_id)
         return False
 
     txt = LINKS_DIR / f"{name}.txt"
     if not txt.exists():
-        await context.bot.send_message(user_id, "Устройство не найдено на сервере.")
+        try:
+            await context.bot.send_message(user_id, "Устройство не найдено на сервере.")
+        except TelegramError:
+            log.warning("could not notify %s that %s is missing on server", user_id, name)
         return False
 
     lines = [l for l in txt.read_text(encoding="utf-8").splitlines() if l.strip()]
@@ -212,7 +218,11 @@ async def fetch_and_send(
                 if png.exists():
                     await context.bot.send_photo(user_id, photo=png.read_bytes(), caption=caption)
         return True
-    except Forbidden:
+    except TelegramError as e:
+        # Forbidden — человек не нажал Start у бота; NetworkError/TimedOut —
+        # например, сеть на секунду пропала из-за docker compose restart xray
+        # (SOCKS-порт бота 127.0.0.1:1080 — это тот же контейнер xray).
+        log.warning("could not deliver links to %s for %s: %s", user_id, name, e)
         return False
 
 
@@ -223,13 +233,19 @@ async def fetch_and_send_special(
         await run_helper("links")  # без имени — обновляет всё, включая telegram/emergency
     except RuntimeError as e:
         log.exception("links helper (special) failed for %s", key)
-        await context.bot.send_message(user_id, f"Ошибка: {e}")
+        try:
+            await context.bot.send_message(user_id, f"Ошибка: {e}")
+        except TelegramError:
+            log.warning("could not notify %s about %s helper failure", user_id, key)
         return False
 
     txt = LINKS_DIR / f"{key}.txt"
     png = LINKS_DIR / f"{key}.png"
     if not txt.exists():
-        await context.bot.send_message(user_id, "Ссылка ещё не создана на сервере.")
+        try:
+            await context.bot.send_message(user_id, "Ссылка ещё не создана на сервере.")
+        except TelegramError:
+            log.warning("could not notify %s that %s link is missing", user_id, key)
         return False
 
     link = txt.read_text(encoding="utf-8").strip()
@@ -241,20 +257,34 @@ async def fetch_and_send_special(
         if png.exists():
             await context.bot.send_photo(user_id, photo=png.read_bytes())
         return True
-    except Forbidden:
+    except TelegramError as e:
+        log.warning("could not deliver %s to %s: %s", key, user_id, e)
         return False
 
 
 async def deliver_notice(update: Update, ok: bool, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type == "private":
         return
-    if ok:
-        await update.effective_message.reply_text("Отправил вам в личные сообщения ✅")
-    else:
-        await update.effective_message.reply_text(
+    text = (
+        "Отправил вам в личные сообщения ✅"
+        if ok
+        else (
             f"Не получилось написать вам в личные сообщения. Откройте чат со мной "
             f"(@{context.bot.username}), нажмите Start и повторите команду здесь."
         )
+    )
+    # Ретрай на случай, если /add только что перезапустил xray и SOCKS-порт
+    # (TELEGRAM_PROXY) ещё пару секунд не отвечал — тогда самое первое
+    # сообщение могло не уйти, хотя устройство уже добавлено.
+    for attempt in (1, 2):
+        try:
+            await update.effective_message.reply_text(text)
+            return
+        except TelegramError as e:
+            log.warning("deliver_notice attempt %d failed: %s", attempt, e)
+            if attempt == 1:
+                await asyncio.sleep(2)
+    log.error("deliver_notice: не удалось написать в чат %s после ретрая", update.effective_chat.id)
 
 
 # --------------------------------------------------------------------------
