@@ -61,6 +61,7 @@ HELP_TEXT = (
     "Я выдаю доступы к VPN и Telegram-прокси. Работаю только в семейном чате "
     "и в личных сообщениях с теми, кого уже видел в этом чате.\n\n"
     "/add имя — добавить новое устройство и получить ссылки и QR\n"
+    "/claim имя — привязать к себе устройство, выпущенное ещё до бота\n"
     "/mydevices — мои устройства\n"
     "/links [имя] — прислать ссылки ещё раз\n"
     "/qr [имя] — прислать QR-коды ещё раз\n"
@@ -361,6 +362,63 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @restricted
+async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Использование: /claim имя_устройства — для устройства, которое уже "
+            "существует на сервере (выпущено до появления бота), но ни к кому "
+            "в боте не привязано. Список таких устройств видит администратор "
+            "командой /devices."
+        )
+        return
+
+    name = context.args[0].strip().lower()
+    state = _load_state()
+    existing = state["devices"].get(name)
+    if existing:
+        if existing["owner_id"] == user.id:
+            await update.effective_message.reply_text(
+                f"«{name}» уже привязано к вам. Ссылки: /links {name}"
+            )
+        else:
+            await update.effective_message.reply_text(
+                "Это устройство уже привязано к другому человеку. Если это ошибка — "
+                "обратитесь к администратору."
+            )
+        return
+
+    try:
+        raw = await run_helper("list")
+    except RuntimeError as e:
+        log.exception("list helper failed for claim %s", name)
+        await update.effective_message.reply_text(f"Не удалось проверить сервер: {e}")
+        return
+
+    real_names = {tok.split("=", 1)[0] for tok in raw.split() if "=" in tok}
+    if name not in real_names:
+        await update.effective_message.reply_text(
+            "На сервере нет устройства с таким именем. Проверьте имя или спросите "
+            "администратора (/devices)."
+        )
+        return
+
+    async with _state_lock:
+        state = _load_state()
+        state["devices"][name] = {
+            "owner_id": user.id,
+            "owner_name": user.full_name,
+            "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        _save_state(state)
+
+    await update.effective_message.reply_text(
+        f"Готово: «{name}» теперь привязано к вам, UUID и ссылки не менялись — "
+        f"переподключать устройство не нужно. Получить их: /links {name} или /qr {name}"
+    )
+
+
+@restricted
 async def cmd_mydevices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     state = _load_state()
@@ -462,7 +520,7 @@ async def cmd_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark = "" if name in real_names else " ⚠ нет в vpn.env"
         lines.append(f"• {name} — {meta['owner_name']} ({meta['added_at'][:10]}){mark}")
     for name in sorted(real_names - set(state["devices"])):
-        lines.append(f"• {name} — добавлено не через бота")
+        lines.append(f"• {name} — добавлено не через бота, привязать: /claim {name}")
 
     await update.effective_message.reply_text(
         "Все устройства:\n" + ("\n".join(lines) if lines else "пусто")
@@ -544,6 +602,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
             BotCommand("add", "добавить устройство"),
+            BotCommand("claim", "привязать устройство, выпущенное до бота"),
             BotCommand("mydevices", "мои устройства"),
             BotCommand("links", "прислать ссылки ещё раз"),
             BotCommand("qr", "прислать QR-коды"),
@@ -581,6 +640,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("claim", cmd_claim))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("links", cmd_links))
     app.add_handler(CommandHandler("qr", cmd_qr))
