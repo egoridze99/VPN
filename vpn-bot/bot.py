@@ -25,7 +25,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.error import TelegramError
+from telegram.error import Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -185,18 +185,18 @@ async def fetch_and_send(
         await run_helper("links", name)
     except RuntimeError as e:
         log.exception("links helper failed for %s", name)
-        try:
-            await context.bot.send_message(user_id, f"Не получилось получить ссылки: {e}")
-        except TelegramError:
-            log.warning("could not notify %s about links helper failure", user_id)
+        await try_send(
+            lambda: context.bot.send_message(user_id, f"Не получилось получить ссылки: {e}"),
+            what=f"dm error(links helper) {name}",
+        )
         return False
 
     txt = LINKS_DIR / f"{name}.txt"
     if not txt.exists():
-        try:
-            await context.bot.send_message(user_id, "Устройство не найдено на сервере.")
-        except TelegramError:
-            log.warning("could not notify %s that %s is missing on server", user_id, name)
+        await try_send(
+            lambda: context.bot.send_message(user_id, "Устройство не найдено на сервере."),
+            what=f"dm error(missing) {name}",
+        )
         return False
 
     lines = [l for l in txt.read_text(encoding="utf-8").splitlines() if l.strip()]
@@ -204,26 +204,37 @@ async def fetch_and_send(
         "Основной профиль (используйте по умолчанию):",
         "Запасной профиль (если основной не работает):",
     ]
-    try:
-        if include_text:
-            await context.bot.send_message(user_id, f"📱 Устройство «{name}»")
-            for label, link in zip(labels, lines):
-                await context.bot.send_message(user_id, f"{label}\n{link}")
-        if include_qr:
-            for suffix, caption in (
-                ("main", "QR основного профиля"),
-                ("backup", "QR запасного профиля"),
+
+    # Каждое сообщение отправляем через try_send: /add только что перезапустил
+    # xray на RU-сервере, а вместе с ним на несколько секунд пропадает и
+    # SOCKS-туннель, через который сам бот ходит в Telegram — без ретрая
+    # именно эта отправка чаще всего и терялась.
+    if include_text:
+        if not await try_send(
+            lambda: context.bot.send_message(user_id, f"📱 Устройство «{name}»"),
+            what=f"dm intro {name}",
+        ):
+            return False
+        for label, link in zip(labels, lines):
+            if not await try_send(
+                lambda label=label, link=link: context.bot.send_message(user_id, f"{label}\n{link}"),
+                what=f"dm link {name}",
             ):
-                png = LINKS_DIR / f"{name}-{suffix}.png"
-                if png.exists():
-                    await context.bot.send_photo(user_id, photo=png.read_bytes(), caption=caption)
-        return True
-    except TelegramError as e:
-        # Forbidden — человек не нажал Start у бота; NetworkError/TimedOut —
-        # например, сеть на секунду пропала из-за docker compose restart xray
-        # (SOCKS-порт бота 127.0.0.1:1080 — это тот же контейнер xray).
-        log.warning("could not deliver links to %s for %s: %s", user_id, name, e)
-        return False
+                return False
+    if include_qr:
+        for suffix, caption in (
+            ("main", "QR основного профиля"),
+            ("backup", "QR запасного профиля"),
+        ):
+            png = LINKS_DIR / f"{name}-{suffix}.png"
+            if png.exists() and not await try_send(
+                lambda png=png, caption=caption: context.bot.send_photo(
+                    user_id, photo=png.read_bytes(), caption=caption
+                ),
+                what=f"dm qr {name}",
+            ):
+                return False
+    return True
 
 
 async def fetch_and_send_special(
@@ -233,51 +244,63 @@ async def fetch_and_send_special(
         await run_helper("links")  # без имени — обновляет всё, включая telegram/emergency
     except RuntimeError as e:
         log.exception("links helper (special) failed for %s", key)
-        try:
-            await context.bot.send_message(user_id, f"Ошибка: {e}")
-        except TelegramError:
-            log.warning("could not notify %s about %s helper failure", user_id, key)
+        await try_send(
+            lambda: context.bot.send_message(user_id, f"Ошибка: {e}"),
+            what=f"dm error(special helper) {key}",
+        )
         return False
 
     txt = LINKS_DIR / f"{key}.txt"
     png = LINKS_DIR / f"{key}.png"
     if not txt.exists():
-        try:
-            await context.bot.send_message(user_id, "Ссылка ещё не создана на сервере.")
-        except TelegramError:
-            log.warning("could not notify %s that %s link is missing", user_id, key)
+        await try_send(
+            lambda: context.bot.send_message(user_id, "Ссылка ещё не создана на сервере."),
+            what=f"dm error(missing) {key}",
+        )
         return False
 
     link = txt.read_text(encoding="utf-8").strip()
-    try:
-        msg = f"🔒 {title}\n{link}"
-        if note:
-            msg += f"\n\n{note}"
-        await context.bot.send_message(user_id, msg)
-        if png.exists():
-            await context.bot.send_photo(user_id, photo=png.read_bytes())
-        return True
-    except TelegramError as e:
-        log.warning("could not deliver %s to %s: %s", key, user_id, e)
+    msg = f"🔒 {title}\n{link}"
+    if note:
+        msg += f"\n\n{note}"
+    if not await try_send(lambda: context.bot.send_message(user_id, msg), what=f"dm {key}"):
         return False
+    if png.exists() and not await try_send(
+        lambda: context.bot.send_photo(user_id, photo=png.read_bytes()), what=f"dm qr {key}"
+    ):
+        return False
+    return True
 
 
-async def resilient(coro_factory, *, what: str, attempts: int = 3, delay: float = 3.0):
+async def resilient(
+    coro_factory, *, what: str, attempts: int = 3, delay: float = 3.0, giveup: tuple = ()
+):
     """Повторяет вызов Telegram API, который может упасть из-за того, что
     /add или /remove только что перезапустили xray на RU-сервере — вместе с
     ним на несколько секунд пропадает и SOCKS-туннель (TELEGRAM_PROXY), через
     который сам бот ходит в Telegram. coro_factory — функция без аргументов,
     возвращающая новую корутину на каждый вызов (нельзя await-нуть одну и ту
-    же корутину дважды)."""
+    же корутину дважды). giveup — исключения, которые повторять бессмысленно
+    (например Forbidden: человек просто не нажал Start, сеть тут ни при чём)
+    — при них отдаём None сразу, без ожидания."""
     for attempt in range(1, attempts + 1):
         try:
             return await coro_factory()
+        except giveup as e:
+            log.info("%s: не повторяю (%s): %s", what, type(e).__name__, e)
+            return None
         except TelegramError as e:
             log.warning("%s: попытка %d/%d не удалась: %s", what, attempt, attempts, e)
             if attempt < attempts:
                 await asyncio.sleep(delay)
     log.error("%s: не удалось после %d попыток", what, attempts)
     return None
+
+
+async def try_send(coro_factory, *, what: str) -> bool:
+    """resilient(), но для отправки конкретному человеку: Forbidden (не нажал
+    Start) не повторяем, остальное — до 3 попыток. Возвращает True/False."""
+    return await resilient(coro_factory, what=what, giveup=(Forbidden,)) is not None
 
 
 async def deliver_notice(update: Update, ok: bool, context: ContextTypes.DEFAULT_TYPE) -> None:
