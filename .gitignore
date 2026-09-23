@@ -1,0 +1,5 @@
+vpn-bot/.env
+vpn-bot/venv/
+vpn-bot/__pycache__/
+vpn-bot/state.json
+vpn-bot/links/

@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram-бот управления VPN-доступами (vpnbot)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpnbot
+Group=vpnbot
+WorkingDirectory=/opt/vpn-bot
+EnvironmentFile=/opt/vpn-bot/.env
+ExecStart=/opt/vpn-bot/venv/bin/python3 /opt/vpn-bot/bot.py
+Restart=on-failure
+RestartSec=5
+# sudo внутри бота (вызов vpnbot-helper.sh) требует обычных привилегий —
+# NoNewPrivileges=true его сломает, поэтому не включаем.
+
+[Install]
+WantedBy=multi-user.target

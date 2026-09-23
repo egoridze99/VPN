@@ -1,0 +1,5 @@
+# Устанавливается в /etc/sudoers.d/vpnbot командой visudo (см. telegram-bot-setup.md).
+# Разрешает пользователю vpnbot запускать ровно один скрипт от root без пароля.
+# Сам скрипт проверяет имена устройств и не пускает ничего, кроме предопределённых
+# подкоманд (add/remove/links/list/status) — см. vpnbot-helper.sh.
+vpnbot ALL=(root) NOPASSWD: /usr/local/bin/vpnbot-helper.sh
