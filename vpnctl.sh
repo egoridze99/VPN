@@ -47,7 +47,7 @@ cmd_init() {
   for v in RU_IP EU_IP CLEANING_DOMAIN TG_HOST VPN_HOST VPN2_HOST EU_HOST; do
     [ -n "${!v:-}" ] || die "сначала заполните $v в $ENV_FILE"
   done
-  command -v docker >/dev/null || die "нужен Docker (шаг 1.1)"
+  command -v docker >/dev/null || die "нужен Docker (этап 2)"
   [ -n "${EU_UUID:-}" ]        || set_var EU_UUID "$(gen_uuid)"
   [ -n "${EMERGENCY_UUID:-}" ] || set_var EMERGENCY_UUID "$(gen_uuid)"
   if [ -z "${RU_PRIVATE_KEY:-}" ]; then
