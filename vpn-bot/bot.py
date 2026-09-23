@@ -262,6 +262,24 @@ async def fetch_and_send_special(
         return False
 
 
+async def resilient(coro_factory, *, what: str, attempts: int = 3, delay: float = 3.0):
+    """Повторяет вызов Telegram API, который может упасть из-за того, что
+    /add или /remove только что перезапустили xray на RU-сервере — вместе с
+    ним на несколько секунд пропадает и SOCKS-туннель (TELEGRAM_PROXY), через
+    который сам бот ходит в Telegram. coro_factory — функция без аргументов,
+    возвращающая новую корутину на каждый вызов (нельзя await-нуть одну и ту
+    же корутину дважды)."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_factory()
+        except TelegramError as e:
+            log.warning("%s: попытка %d/%d не удалась: %s", what, attempt, attempts, e)
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+    log.error("%s: не удалось после %d попыток", what, attempts)
+    return None
+
+
 async def deliver_notice(update: Update, ok: bool, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type == "private":
         return
@@ -273,18 +291,9 @@ async def deliver_notice(update: Update, ok: bool, context: ContextTypes.DEFAULT
             f"(@{context.bot.username}), нажмите Start и повторите команду здесь."
         )
     )
-    # Ретрай на случай, если /add только что перезапустил xray и SOCKS-порт
-    # (TELEGRAM_PROXY) ещё пару секунд не отвечал — тогда самое первое
-    # сообщение могло не уйти, хотя устройство уже добавлено.
-    for attempt in (1, 2):
-        try:
-            await update.effective_message.reply_text(text)
-            return
-        except TelegramError as e:
-            log.warning("deliver_notice attempt %d failed: %s", attempt, e)
-            if attempt == 1:
-                await asyncio.sleep(2)
-    log.error("deliver_notice: не удалось написать в чат %s после ретрая", update.effective_chat.id)
+    await resilient(
+        lambda: update.effective_message.reply_text(text), what="deliver_notice"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -374,7 +383,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await run_helper("add", name)
     except RuntimeError as e:
         log.exception("add-device failed for %s", name)
-        await status_msg.edit_text(f"Не получилось добавить устройство: {e}")
+        await resilient(
+            lambda: status_msg.edit_text(f"Не получилось добавить устройство: {e}"),
+            what="add-fail edit",
+        )
         return
 
     async with _state_lock:
@@ -387,7 +399,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save_state(state)
 
     ok = await fetch_and_send(context, user.id, name, include_text=True, include_qr=True)
-    await status_msg.edit_text(f"✅ Устройство «{name}» добавлено.")
+    await resilient(
+        lambda: status_msg.edit_text(f"✅ Устройство «{name}» добавлено."),
+        what="add-success edit",
+    )
     await deliver_notice(update, ok, context)
 
 
@@ -615,13 +630,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_helper("remove", name)
         except RuntimeError as e:
             log.exception("remove-device failed for %s", name)
-            await query.edit_message_text(f"Не получилось удалить: {e}")
+            await resilient(
+                lambda: query.edit_message_text(f"Не получилось удалить: {e}"),
+                what="remove-fail edit",
+            )
             return
         async with _state_lock:
             state = _load_state()
             state["devices"].pop(name, None)
             _save_state(state)
-        await query.edit_message_text(f"Устройство «{name}» удалено.")
+        # run_helper("remove", ...) только что перезапустил xray — SOCKS-туннель
+        # бота мог на пару секунд пропасть, поэтому с ретраем.
+        await resilient(
+            lambda: query.edit_message_text(f"Устройство «{name}» удалено."),
+            what="remove-success edit",
+        )
 
 
 # --------------------------------------------------------------------------
